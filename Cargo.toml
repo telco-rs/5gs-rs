@@ -11,5 +11,16 @@ repository = "https://github.com/rs-5gs/rs-5gs"
 homepage = "rs-5gs.agm.dev"
 
 [workspace.dependencies]
+thiserror = "2.0.18"
 serde = "1.0.228"
+
+# HTTP
 tokio = { version = "1.49.0", features = ["full"] }
+axum = "0.8.8"
+tower-http = "0.6.8"
+http = "1.4.0"
+validator = "0.20.0"
+url = "2.5.8"
+
+# 5gs-rs
+ngs-common = { path = "crates/common" }

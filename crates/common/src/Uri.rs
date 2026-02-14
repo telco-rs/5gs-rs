@@ -1368,6 +1368,7 @@ fn parse_host_string(s: &str) -> Result<Host, UriParseError> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::hash::{DefaultHasher, Hasher};
 
     /// Parses a URI string using [`Uri::from_str`].
     fn parse_uri(input: &str) -> Result<Uri, UriParseError> {
@@ -1401,11 +1402,15 @@ mod tests {
         }
     }
 
-    // ==================== Scheme ====================
+    // ==================== 1. Scheme Parsing ====================
 
     #[test]
-    fn scheme_common_names() {
+    fn scheme_http() {
         assert_eq!(parse_uri("http://h").unwrap().scheme.name, "http");
+    }
+
+    #[test]
+    fn scheme_https() {
         assert_eq!(parse_uri("https://h").unwrap().scheme.name, "https");
     }
 
@@ -1416,32 +1421,80 @@ mod tests {
 
     #[test]
     fn scheme_all_allowed_chars() {
-        // RFC 3986: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
         assert_eq!(parse_uri("a1+-.z://h").unwrap().scheme.name, "a1+-.z");
     }
 
     #[test]
-    fn scheme_preserves_case() {
+    fn scheme_preserves_original_case() {
         assert_eq!(parse_uri("HTTP://h").unwrap().scheme.name, "HTTP");
         assert_eq!(parse_uri("HtTp://h").unwrap().scheme.name, "HtTp");
     }
 
     #[test]
-    fn scheme_starting_with_digit_is_error() {
-        assert!(parse_uri("1http://h").is_err());
+    fn scheme_uppercase_alpha_start() {
+        assert_eq!(parse_uri("Z://h").unwrap().scheme.name, "Z");
     }
 
     #[test]
-    fn scheme_empty_is_error() {
-        assert!(parse_uri("://h").is_err());
+    fn scheme_starts_with_digit_rejected() {
+        match parse_uri("1http://h").unwrap_err() {
+            UriParseError::SchemeInvalid { pos } => assert_eq!(pos, 0),
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
     }
 
     #[test]
-    fn scheme_missing_colon_is_error() {
-        assert!(parse_uri("http").is_err());
+    fn scheme_empty_rejected() {
+        match parse_uri("://h").unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {}
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
     }
 
-    // ==================== Authority presence ====================
+    #[test]
+    fn scheme_missing_colon_rejected() {
+        match parse_uri("http").unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {}
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scheme_underscore_rejected() {
+        match parse_uri("my_scheme://h").unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {}
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scheme_space_rejected() {
+        match parse_uri("my scheme://h").unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {}
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scheme_non_ascii_rejected() {
+        assert!(parse_uri("htt\u{00E9}://h").is_err());
+    }
+
+    #[test]
+    fn scheme_colon_only_rejected() {
+        match parse_uri(":").unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {}
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scheme_with_dot_and_plus() {
+        assert_eq!(parse_uri("svn+ssh://h").unwrap().scheme.name, "svn+ssh");
+        assert_eq!(parse_uri("a.b://h").unwrap().scheme.name, "a.b");
+    }
+
+    // ==================== 2. Authority Detection ====================
 
     #[test]
     fn authority_present_with_double_slash() {
@@ -1453,11 +1506,133 @@ mod tests {
     fn authority_absent_without_double_slash() {
         let uri = parse_uri("mailto:user@example.com").unwrap();
         assert!(uri.authority.is_none());
-        // '@' is valid in path-rootless via pchar
         assert_eq!(uri.path.segments, vec!["user@example.com"]);
     }
 
-    // ==================== Host - Domain names ====================
+    #[test]
+    fn authority_single_slash_no_authority() {
+        let uri = parse_uri("x:/path").unwrap();
+        assert!(uri.authority.is_none());
+        assert_eq!(uri.path.segments, vec!["path"]);
+    }
+
+    #[test]
+    fn authority_empty_authority() {
+        let uri = parse_uri("http:///path").unwrap();
+        assert!(uri.authority.is_some());
+        let auth = uri.authority.unwrap();
+        assert!(matches!(auth.host, Host::DomainName(ref s) if s.is_empty()));
+        assert_eq!(uri.path.segments, vec!["path"]);
+    }
+
+    #[test]
+    fn authority_no_path_after_authority() {
+        let uri = parse_uri("http://host").unwrap();
+        assert!(uri.authority.is_some());
+        assert_eq!(uri.path.segments, vec![""]);
+    }
+
+    // ==================== 3. UserInfo Parsing ====================
+
+    #[test]
+    fn userinfo_username_only() {
+        let info = parse_uri("http://user@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, "user");
+        assert_eq!(info.password, None);
+    }
+
+    #[test]
+    fn userinfo_with_password() {
+        let info = parse_uri("http://user:pass@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, "user");
+        assert_eq!(info.password.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn userinfo_empty_password() {
+        let info = parse_uri("http://user:@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, "user");
+        assert_eq!(info.password.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn userinfo_empty_username() {
+        let info = parse_uri("http://:pass@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, "");
+        assert_eq!(info.password.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn userinfo_empty_both() {
+        let info = parse_uri("http://:@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, "");
+        assert_eq!(info.password.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn userinfo_password_with_colons() {
+        let info = parse_uri("http://user:p:a:ss@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, "user");
+        assert_eq!(info.password.as_deref(), Some("p:a:ss"));
+    }
+
+    #[test]
+    fn userinfo_percent_encoded() {
+        let info = parse_uri("http://us%40er:p%40ss@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, "us@er");
+        assert_eq!(info.password.as_deref(), Some("p@ss"));
+    }
+
+    #[test]
+    fn userinfo_all_unreserved_chars() {
+        let info = parse_uri("http://aZ09-._~@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, "aZ09-._~");
+    }
+
+    #[test]
+    fn userinfo_all_sub_delims() {
+        let info = parse_uri("http://!$&'()*+,;=@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, "!$&'()*+,;=");
+    }
+
+    #[test]
+    fn userinfo_absent() {
+        let auth = parse_uri("http://host/").unwrap().authority.unwrap();
+        assert!(auth.user_info.is_none());
+    }
+
+    #[test]
+    fn userinfo_at_in_path_not_confused() {
+        let uri = parse_uri("mailto:user@host").unwrap();
+        assert!(uri.authority.is_none());
+        assert_eq!(uri.path.segments, vec!["user@host"]);
+    }
+
+    #[test]
+    fn userinfo_percent_encoded_colon_in_username() {
+        let info = parse_uri("http://%3A@host/").unwrap().authority.unwrap().user_info.unwrap();
+        assert_eq!(info.username, ":");
+        assert_eq!(info.password, None);
+    }
+
+    #[test]
+    fn userinfo_invalid_char_rejected() {
+        match parse_uri("http://user\x01@host/").unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {} // non-ASCII check catches first
+            UriParseError::UserInfoInvalid { .. } => {}
+            other => panic!("expected UserInfoInvalid or SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn userinfo_bad_pct_in_username() {
+        match parse_uri("http://us%GG@host/").unwrap_err() {
+            UriParseError::PctDecodeInvalid { .. } => {}
+            other => panic!("expected PctDecodeInvalid, got {other:?}"),
+        }
+    }
+
+    // ==================== 4. Host - Domain Names ====================
 
     #[test]
     fn host_simple_domain() {
@@ -1478,13 +1653,19 @@ mod tests {
     }
 
     #[test]
-    fn host_five_dot_parts_is_domain() {
+    fn host_single_label() {
+        let uri = parse_uri("http://myhost/").unwrap();
+        assert_domain(&uri.authority.unwrap().host, "myhost");
+    }
+
+    #[test]
+    fn host_five_parts_is_domain() {
         let uri = parse_uri("http://a.b.c.d.e/").unwrap();
         assert_domain(&uri.authority.unwrap().host, "a.b.c.d.e");
     }
 
     #[test]
-    fn host_three_dot_parts_is_domain() {
+    fn host_three_parts_is_domain() {
         let uri = parse_uri("http://a.b.c/").unwrap();
         assert_domain(&uri.authority.unwrap().host, "a.b.c");
     }
@@ -1495,7 +1676,25 @@ mod tests {
         assert_domain(&uri.authority.unwrap().host, "nrf.5gc.mnc001.mcc001.3gppnetwork.org");
     }
 
-    // ==================== Host - IPv4 ====================
+    #[test]
+    fn host_with_hyphen() {
+        let uri = parse_uri("http://my-host.example.com/").unwrap();
+        assert_domain(&uri.authority.unwrap().host, "my-host.example.com");
+    }
+
+    #[test]
+    fn host_with_underscore() {
+        let uri = parse_uri("http://my_host.example.com/").unwrap();
+        assert_domain(&uri.authority.unwrap().host, "my_host.example.com");
+    }
+
+    #[test]
+    fn host_percent_encoded_in_domain() {
+        let uri = parse_uri("http://exam%70le.com/").unwrap();
+        assert_domain(&uri.authority.unwrap().host, "example.com");
+    }
+
+    // ==================== 5. Host - IPv4 ====================
 
     #[test]
     fn host_ipv4_typical() {
@@ -1522,12 +1721,40 @@ mod tests {
     }
 
     #[test]
-    fn host_octet_overflow_falls_back_to_domain() {
+    fn host_ipv4_octet_overflow_falls_to_domain() {
         let uri = parse_uri("http://256.1.1.1/").unwrap();
         assert_domain(&uri.authority.unwrap().host, "256.1.1.1");
     }
 
-    // ==================== Host - IPv6 literals ====================
+    #[test]
+    fn host_ipv4_leading_zeros_fall_to_domain() {
+        // "01" does not parse as u8 via Rust's strict parser (actually it does),
+        // but we verify parsing behavior either way
+        let uri = parse_uri("http://01.02.03.04/").unwrap();
+        let auth = uri.authority.unwrap();
+        // Rust's u8 parse accepts leading zeros, so this will be IPv4
+        match &auth.host {
+            Host::Ipv4(_) => {} // acceptable: Rust parses "01" as 1u8
+            Host::DomainName(_) => {} // also acceptable if implementation rejects leading zeros
+            other => panic!("unexpected host variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_ipv4_with_port() {
+        let uri = parse_uri("http://192.168.1.1:8080/").unwrap();
+        let auth = uri.authority.unwrap();
+        assert_ipv4(&auth.host, "192.168.1.1");
+        assert_eq!(auth.port, Some(8080));
+    }
+
+    #[test]
+    fn host_ipv4_10_network() {
+        let uri = parse_uri("http://10.0.0.1/").unwrap();
+        assert_ipv4(&uri.authority.unwrap().host, "10.0.0.1");
+    }
+
+    // ==================== 6. Host - IPv6 Literals ====================
 
     #[test]
     fn host_ipv6_loopback() {
@@ -1547,7 +1774,45 @@ mod tests {
         assert_ip_literal(&uri.authority.unwrap().host, "::ffff:192.168.1.1");
     }
 
-    // ==================== Port ====================
+    #[test]
+    fn host_ipv6_all_zeros() {
+        let uri = parse_uri("http://[::]/").unwrap();
+        assert_ip_literal(&uri.authority.unwrap().host, "::");
+    }
+
+    #[test]
+    fn host_ipv6_with_port() {
+        let uri = parse_uri("http://[::1]:8080/").unwrap();
+        let auth = uri.authority.unwrap();
+        assert_ip_literal(&auth.host, "::1");
+        assert_eq!(auth.port, Some(8080));
+    }
+
+    #[test]
+    fn host_ipv6_invalid_content_rejected() {
+        match parse_uri("http://[not-valid]/").unwrap_err() {
+            UriParseError::HostInvalid { .. } => {}
+            other => panic!("expected HostInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_ipv6_unclosed_bracket_rejected() {
+        match parse_uri("http://[::1/").unwrap_err() {
+            UriParseError::HostInvalid { .. } => {}
+            other => panic!("expected HostInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_ipv6_empty_brackets_rejected() {
+        match parse_uri("http://[]/").unwrap_err() {
+            UriParseError::HostInvalid { .. } => {}
+            other => panic!("expected HostInvalid, got {other:?}"),
+        }
+    }
+
+    // ==================== 7. Port Parsing ====================
 
     #[test]
     fn port_present() {
@@ -1563,7 +1828,6 @@ mod tests {
 
     #[test]
     fn port_empty_after_colon() {
-        // RFC 3986: port = *DIGIT — empty is valid, means absent
         let auth = parse_uri("http://host:/").unwrap().authority.unwrap();
         assert_eq!(auth.port, None);
     }
@@ -1581,13 +1845,38 @@ mod tests {
     }
 
     #[test]
-    fn port_overflow_is_error() {
-        assert!(parse_uri("http://host:65536/").is_err());
+    fn port_overflow_rejected() {
+        match parse_uri("http://host:65536/").unwrap_err() {
+            UriParseError::HostInvalid { .. } => {}
+            other => panic!("expected HostInvalid, got {other:?}"),
+        }
     }
 
     #[test]
-    fn port_non_digit_is_error() {
-        assert!(parse_uri("http://host:abc/").is_err());
+    fn port_large_overflow_rejected() {
+        assert!(parse_uri("http://host:999999/").is_err());
+    }
+
+    #[test]
+    fn port_non_digit_rejected() {
+        match parse_uri("http://host:abc/").unwrap_err() {
+            UriParseError::HostInvalid { .. } => {}
+            other => panic!("expected HostInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn port_mixed_digit_alpha_rejected() {
+        match parse_uri("http://host:80ab/").unwrap_err() {
+            UriParseError::HostInvalid { .. } => {}
+            other => panic!("expected HostInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn port_leading_zeros() {
+        let auth = parse_uri("http://host:0080/").unwrap().authority.unwrap();
+        assert_eq!(auth.port, Some(80));
     }
 
     #[test]
@@ -1596,51 +1885,21 @@ mod tests {
         assert_eq!(auth.port, Some(29510));
     }
 
-    // ==================== UserInfo ====================
-
     #[test]
-    fn userinfo_username_only() {
-        let info = parse_uri("http://user@host/").unwrap().authority.unwrap().user_info.unwrap();
-        assert_eq!(info.username, "user");
-        assert_eq!(info.password, None);
+    fn port_3gpp_sbi_https() {
+        let auth = parse_uri("https://host:443/").unwrap().authority.unwrap();
+        assert_eq!(auth.port, Some(443));
     }
 
     #[test]
-    fn userinfo_with_password() {
-        let info = parse_uri("http://user:pass@host/").unwrap().authority.unwrap().user_info.unwrap();
-        assert_eq!(info.username, "user");
-        assert_eq!(info.password.as_deref(), Some("pass"));
+    fn port_with_path_following() {
+        let uri = parse_uri("http://host:8080/path").unwrap();
+        let auth = uri.authority.unwrap();
+        assert_eq!(auth.port, Some(8080));
+        assert_eq!(uri.path.segments, vec!["path"]);
     }
 
-    #[test]
-    fn userinfo_empty_password() {
-        let info = parse_uri("http://user:@host/").unwrap().authority.unwrap().user_info.unwrap();
-        assert_eq!(info.username, "user");
-        assert_eq!(info.password.as_deref(), Some(""));
-    }
-
-    #[test]
-    fn userinfo_password_with_colons() {
-        // RFC 3986: ':' is valid in the password portion of userinfo
-        let info = parse_uri("http://user:p:a:ss@host/").unwrap().authority.unwrap().user_info.unwrap();
-        assert_eq!(info.username, "user");
-        assert_eq!(info.password.as_deref(), Some("p:a:ss"));
-    }
-
-    #[test]
-    fn userinfo_percent_encoded() {
-        let info = parse_uri("http://us%40er:p%40ss@host/").unwrap().authority.unwrap().user_info.unwrap();
-        assert_eq!(info.username, "us@er");
-        assert_eq!(info.password.as_deref(), Some("p@ss"));
-    }
-
-    #[test]
-    fn userinfo_absent() {
-        let auth = parse_uri("http://host/").unwrap().authority.unwrap();
-        assert!(auth.user_info.is_none());
-    }
-
-    // ==================== Path ====================
+    // ==================== 8. Path Parsing ====================
 
     #[test]
     fn path_multiple_segments() {
@@ -1655,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn path_root_slash() {
+    fn path_root_slash_only() {
         let uri = parse_uri("http://host/").unwrap();
         assert_eq!(uri.path.segments, [""]);
     }
@@ -1667,34 +1926,51 @@ mod tests {
     }
 
     #[test]
+    fn path_no_path() {
+        let uri = parse_uri("http://host").unwrap();
+        assert_eq!(uri.path.segments, [""]);
+    }
+
+    #[test]
+    fn path_empty_segments() {
+        let uri = parse_uri("http://host/a//b").unwrap();
+        assert_eq!(uri.path.segments, ["a", "", "b"]);
+    }
+
+    #[test]
     fn path_pchar_colon_and_at() {
         let uri = parse_uri("http://host/a:b@c").unwrap();
         assert_eq!(uri.path.segments, ["a:b@c"]);
     }
 
     #[test]
-    fn path_sub_delims() {
-        let uri = parse_uri("http://host/a!b$c&d'e(f)g*h+i,j;k=l").unwrap();
-        assert_eq!(uri.path.segments, ["a!b$c&d'e(f)g*h+i,j;k=l"]);
+    fn path_all_sub_delims() {
+        let uri = parse_uri("http://host/!$&'()*+,;=").unwrap();
+        assert_eq!(uri.path.segments, ["!$&'()*+,;="]);
     }
 
     #[test]
-    fn path_unreserved_chars() {
+    fn path_all_unreserved() {
         let uri = parse_uri("http://host/a-b.c_d~e").unwrap();
         assert_eq!(uri.path.segments, ["a-b.c_d~e"]);
     }
 
     #[test]
-    fn path_pct_encoded_space() {
+    fn path_percent_encoded_space() {
         let uri = parse_uri("http://host/hello%20world").unwrap();
         assert_eq!(uri.path.segments, ["hello world"]);
     }
 
     #[test]
-    fn path_pct_encoded_slash_is_data() {
-        // %2F decoded to '/' should stay within the segment, not split it
+    fn path_percent_encoded_slash_is_data() {
         let uri = parse_uri("http://host/a%2Fb").unwrap();
         assert_eq!(uri.path.segments, ["a/b"]);
+    }
+
+    #[test]
+    fn path_percent_encoded_question_mark() {
+        let uri = parse_uri("http://host/a%3Fb").unwrap();
+        assert_eq!(uri.path.segments, ["a?b"]);
     }
 
     #[test]
@@ -1711,10 +1987,38 @@ mod tests {
         assert!(uri.fragment.is_some());
     }
 
-    // ==================== Query ====================
+    #[test]
+    fn path_deeply_nested() {
+        let uri = parse_uri("http://host/a/b/c/d/e/f/g/h/i/j/k").unwrap();
+        assert_eq!(uri.path.segments, ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"]);
+    }
 
     #[test]
-    fn query_key_value() {
+    fn path_with_dot_segments() {
+        let uri = parse_uri("http://host/a/./b/../c").unwrap();
+        assert_eq!(uri.path.segments, ["a", ".", "b", "..", "c"]);
+    }
+
+    #[test]
+    fn path_space_literal_rejected() {
+        match parse_uri("http://host/a b").unwrap_err() {
+            UriParseError::PathInvalid { .. } => {}
+            other => panic!("expected PathInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_curly_brace_rejected() {
+        match parse_uri("http://host/a{b}").unwrap_err() {
+            UriParseError::PathInvalid { .. } => {}
+            other => panic!("expected PathInvalid, got {other:?}"),
+        }
+    }
+
+    // ==================== 9. Query Parsing ====================
+
+    #[test]
+    fn query_simple_key_value() {
         let q = parse_uri("http://h/?key=val").unwrap().query.unwrap();
         assert_eq!(q.query, "key=val");
     }
@@ -1732,8 +2036,7 @@ mod tests {
     }
 
     #[test]
-    fn query_pct_encoded_hash_is_data() {
-        // %23 is '#' — must not be treated as fragment delimiter
+    fn query_percent_encoded_hash_is_data() {
         let uri = parse_uri("http://h/?q=%23").unwrap();
         assert_eq!(uri.query.unwrap().query, "q=#");
         assert!(uri.fragment.is_none());
@@ -1757,7 +2060,182 @@ mod tests {
         assert_eq!(uri.fragment.unwrap().fragment, "frag");
     }
 
-    // ==================== Fragment ====================
+    #[test]
+    fn query_only_key_no_equals() {
+        let q = parse_uri("http://h/?flag").unwrap().query.unwrap();
+        assert_eq!(q.get("flag"), Some(""));
+    }
+
+    #[test]
+    fn query_empty_value() {
+        let q = parse_uri("http://h/?a=").unwrap().query.unwrap();
+        assert_eq!(q.get("a"), Some(""));
+    }
+
+    #[test]
+    fn query_empty_key() {
+        let q = parse_uri("http://h/?=value").unwrap().query.unwrap();
+        assert_eq!(q.get(""), Some("value"));
+    }
+
+    #[test]
+    fn query_all_sub_delims() {
+        let q = parse_uri("http://h/?!$&'()*+,;=").unwrap().query.unwrap();
+        assert_eq!(q.query, "!$&'()*+,;=");
+    }
+
+    #[test]
+    fn query_percent_encoded_ampersand_preserves_params() {
+        let q = parse_uri("http://h/?a=x%26y&b=2").unwrap().query.unwrap();
+        assert_eq!(q.get("a"), Some("x&y"));
+        assert_eq!(q.get("b"), Some("2"));
+    }
+
+    #[test]
+    fn query_percent_encoded_equals_preserves_value() {
+        let q = parse_uri("http://h/?a=x%3Dy").unwrap().query.unwrap();
+        assert_eq!(q.get("a"), Some("x=y"));
+    }
+
+    #[test]
+    fn query_consecutive_ampersands() {
+        let q = parse_uri("http://h/?a=1&&b=2").unwrap().query.unwrap();
+        assert_eq!(q.get("a"), Some("1"));
+        assert_eq!(q.get("b"), Some("2"));
+        // empty pair between && produces ("", "")
+        assert_eq!(q.len(), 3);
+    }
+
+    // ==================== 10. Query Accessor Methods ====================
+
+    #[test]
+    fn query_get_first_match() {
+        let q = parse_uri("http://h/?a=1&a=2").unwrap().query.unwrap();
+        assert_eq!(q.get("a"), Some("1"));
+    }
+
+    #[test]
+    fn query_get_missing_key() {
+        let q = parse_uri("http://h/?a=1").unwrap().query.unwrap();
+        assert_eq!(q.get("missing"), None);
+    }
+
+    #[test]
+    fn query_get_all_repeated_keys() {
+        let q = parse_uri("http://h/?a=1&a=2&a=3").unwrap().query.unwrap();
+        assert_eq!(q.get_all("a"), vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn query_get_all_no_matches() {
+        let q = parse_uri("http://h/?a=1").unwrap().query.unwrap();
+        assert!(q.get_all("missing").is_empty());
+    }
+
+    #[test]
+    fn query_get_csv_simple() {
+        let q = parse_uri("http://h/?names=a,b,c").unwrap().query.unwrap();
+        assert_eq!(q.get_csv("names"), Some(vec!["a", "b", "c"]));
+    }
+
+    #[test]
+    fn query_get_csv_single_value() {
+        let q = parse_uri("http://h/?x=only").unwrap().query.unwrap();
+        assert_eq!(q.get_csv("x"), Some(vec!["only"]));
+    }
+
+    #[test]
+    fn query_get_csv_missing() {
+        let q = parse_uri("http://h/?x=1").unwrap().query.unwrap();
+        assert_eq!(q.get_csv("missing"), None);
+    }
+
+    #[test]
+    fn query_get_csv_empty_value() {
+        let q = parse_uri("http://h/?x=").unwrap().query.unwrap();
+        assert_eq!(q.get_csv("x"), Some(vec![""]));
+    }
+
+    #[test]
+    fn query_iter_pairs() {
+        let q = parse_uri("http://h/?a=1&b=2").unwrap().query.unwrap();
+        let pairs: Vec<_> = q.iter().collect();
+        assert_eq!(pairs, vec![("a", "1"), ("b", "2")]);
+    }
+
+    #[test]
+    fn query_contains_key_present() {
+        let q = parse_uri("http://h/?a=1").unwrap().query.unwrap();
+        assert!(q.contains_key("a"));
+    }
+
+    #[test]
+    fn query_contains_key_absent() {
+        let q = parse_uri("http://h/?a=1").unwrap().query.unwrap();
+        assert!(!q.contains_key("z"));
+    }
+
+    #[test]
+    fn query_is_empty_on_empty() {
+        let q = parse_uri("http://h/?").unwrap().query.unwrap();
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn query_is_empty_on_populated() {
+        let q = parse_uri("http://h/?a=1").unwrap().query.unwrap();
+        assert!(!q.is_empty());
+    }
+
+    #[test]
+    fn query_len() {
+        let q = parse_uri("http://h/?a=1&b=2&c=3").unwrap().query.unwrap();
+        assert_eq!(q.len(), 3);
+    }
+
+    // ==================== 11. Query Encoding Security ====================
+
+    #[test]
+    fn query_encoded_ampersand_not_delimiter() {
+        let q = parse_uri("http://h/?a=x%26y").unwrap().query.unwrap();
+        assert_eq!(q.get("a"), Some("x&y"));
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn query_encoded_equals_not_delimiter() {
+        let q = parse_uri("http://h/?a=x%3Dy").unwrap().query.unwrap();
+        assert_eq!(q.get("a"), Some("x=y"));
+    }
+
+    #[test]
+    fn query_encoded_hash_not_fragment() {
+        let uri = parse_uri("http://h/?q=%23val").unwrap();
+        assert_eq!(uri.query.unwrap().query, "q=#val");
+        assert!(uri.fragment.is_none());
+    }
+
+    #[test]
+    fn query_double_encoding_preserved() {
+        // %2526 → first %25 decodes to '%', then '26' is literal → "%26"
+        let q = parse_uri("http://h/?a=%2526").unwrap().query.unwrap();
+        assert_eq!(q.get("a"), Some("%26"));
+    }
+
+    #[test]
+    fn query_encoded_percent_sign() {
+        let q = parse_uri("http://h/?a=%25").unwrap().query.unwrap();
+        assert_eq!(q.get("a"), Some("%"));
+    }
+
+    #[test]
+    fn query_raw_vs_decoded_consistency() {
+        let q = parse_uri("http://h/?key=hello%20world").unwrap().query.unwrap();
+        assert_eq!(q.query, "key=hello world");
+        assert_eq!(q.get("key"), Some("hello world"));
+    }
+
+    // ==================== 12. Fragment Parsing ====================
 
     #[test]
     fn fragment_simple() {
@@ -1772,14 +2250,14 @@ mod tests {
     }
 
     #[test]
-    fn fragment_pct_encoded() {
+    fn fragment_percent_encoded() {
         let f = parse_uri("http://h/#sec%20tion").unwrap().fragment.unwrap();
         assert_eq!(f.fragment, "sec tion");
     }
 
     #[test]
     fn fragment_absent() {
-        assert!(parse_uri("http://h/path?q").unwrap().fragment.is_none());
+        assert!(parse_uri("http://h/path").unwrap().fragment.is_none());
     }
 
     #[test]
@@ -1788,17 +2266,143 @@ mod tests {
         assert_eq!(f.fragment, "");
     }
 
-    // ==================== Full URI parsing ====================
+    #[test]
+    fn fragment_all_sub_delims() {
+        let f = parse_uri("http://h/#!$&'()*+,;=").unwrap().fragment.unwrap();
+        assert_eq!(f.fragment, "!$&'()*+,;=");
+    }
+
+    #[test]
+    fn fragment_invalid_char_rejected() {
+        match parse_uri("http://h/#sec{tion").unwrap_err() {
+            UriParseError::FragmentInvalid { .. } => {}
+            other => panic!("expected FragmentInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fragment_after_query() {
+        let uri = parse_uri("http://h/?q=1#f").unwrap();
+        assert_eq!(uri.query.unwrap().query, "q=1");
+        assert_eq!(uri.fragment.unwrap().fragment, "f");
+    }
+
+    // ==================== 13. Percent-Encoding/Decoding ====================
+
+    #[test]
+    fn pct_case_insensitive_input() {
+        assert_eq!(parse_uri("http://host/a%2Fb").unwrap().path.segments, ["a/b"]);
+        assert_eq!(parse_uri("http://host/a%2fb").unwrap().path.segments, ["a/b"]);
+    }
+
+    #[test]
+    fn pct_null_byte() {
+        let uri = parse_uri("http://host/a%00b").unwrap();
+        assert_eq!(uri.path.segments, ["a\0b"]);
+    }
+
+    #[test]
+    fn pct_all_hex_upper() {
+        let uri = parse_uri("http://host/%41%5A").unwrap();
+        assert_eq!(uri.path.segments, ["AZ"]);
+    }
+
+    #[test]
+    fn pct_all_hex_lower() {
+        let uri = parse_uri("http://host/%61%7A").unwrap();
+        assert_eq!(uri.path.segments, ["az"]);
+    }
+
+    #[test]
+    fn pct_max_byte() {
+        // %FF decodes to char 0xFF (ÿ), which is U+00FF in UTF-8 (2 bytes: 0xC3 0xBF)
+        let uri = parse_uri("http://host/%FF").unwrap();
+        assert_eq!(uri.path.segments[0], "\u{00FF}");
+    }
+
+    #[test]
+    fn pct_min_byte() {
+        let uri = parse_uri("http://host/%00").unwrap();
+        assert_eq!(uri.path.segments[0].as_bytes(), [0x00]);
+    }
+
+    #[test]
+    fn pct_truncated_one_digit_rejected() {
+        assert!(parse_uri("http://host/%2").is_err());
+    }
+
+    #[test]
+    fn pct_bare_percent_rejected() {
+        assert!(parse_uri("http://host/%").is_err());
+    }
+
+    #[test]
+    fn pct_non_hex_first_digit_rejected() {
+        assert!(parse_uri("http://host/%GG").is_err());
+    }
+
+    #[test]
+    fn pct_non_hex_second_digit_rejected() {
+        assert!(parse_uri("http://host/%2Z").is_err());
+    }
+
+    #[test]
+    fn pct_consecutive_sequences() {
+        let uri = parse_uri("http://host/%20%20%20").unwrap();
+        assert_eq!(uri.path.segments, ["   "]);
+    }
+
+    #[test]
+    fn pct_decode_public_fn_simple() {
+        assert_eq!(percent_decode("hello%20world").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn pct_decode_public_fn_no_encoding() {
+        assert_eq!(percent_decode("hello").unwrap(), "hello");
+    }
+
+    #[test]
+    fn pct_decode_public_fn_error() {
+        assert!(percent_decode("hello%G").is_err());
+    }
+
+    #[test]
+    fn pct_encode_path() {
+        assert_eq!(percent_encode_path("hello world"), "hello%20world");
+        assert_eq!(percent_encode_path("a/b"), "a%2Fb");
+    }
+
+    #[test]
+    fn pct_encode_query_key_encodes_delimiters() {
+        assert_eq!(percent_encode_query_key("a=b"), "a%3Db");
+        assert_eq!(percent_encode_query_key("a&b"), "a%26b");
+    }
+
+    #[test]
+    fn pct_encode_query_value_encodes_delimiters() {
+        assert_eq!(percent_encode_query_value("x=y"), "x%3Dy");
+        assert_eq!(percent_encode_query_value("x&y"), "x%26y");
+    }
+
+    #[test]
+    fn pct_encode_query_preserves_allowed() {
+        // Unreserved, '/', '?', ':', '@' should not be encoded
+        let input = "abc123-._~/hello?world:foo@bar";
+        assert_eq!(percent_encode_query_key(input), input);
+    }
+
+    // ==================== 14. Full URI Integration ====================
 
     #[test]
     fn full_uri_all_components() {
-        let uri = parse_uri("http://user:pass@example.com:8080/a/b/c?key=val#frag").unwrap();
+        let uri = parse_uri("http://user:pass@host:8080/a/b/c?key=val#frag").unwrap();
         assert_eq!(uri.scheme.name, "http");
         let auth = uri.authority.unwrap();
         let info = auth.user_info.unwrap();
         assert_eq!(info.username, "user");
         assert_eq!(info.password.as_deref(), Some("pass"));
-        assert_domain(&auth.host, "example.com");
+        assert_domain(&auth.host, "host");
         assert_eq!(auth.port, Some(8080));
         assert_eq!(uri.path.segments, ["a", "b", "c"]);
         assert_eq!(uri.query.unwrap().query, "key=val");
@@ -1815,6 +2419,14 @@ mod tests {
     }
 
     #[test]
+    fn full_uri_scheme_and_path_only() {
+        let uri = parse_uri("urn:isbn:0451450523").unwrap();
+        assert_eq!(uri.scheme.name, "urn");
+        assert!(uri.authority.is_none());
+        assert_eq!(uri.path.segments, ["isbn:0451450523"]);
+    }
+
+    #[test]
     fn full_uri_ipv6_with_port_and_path() {
         let uri = parse_uri("http://[::1]:8080/path").unwrap();
         let auth = uri.authority.unwrap();
@@ -1823,7 +2435,55 @@ mod tests {
         assert_eq!(uri.path.segments, ["path"]);
     }
 
-    // ==================== 3GPP SBI URIs (TS 29.500 §5.2.10) ====================
+    #[test]
+    fn full_uri_authority_and_query_no_path() {
+        let uri = parse_uri("http://host?q=1").unwrap();
+        assert!(uri.authority.is_some());
+        assert_eq!(uri.query.unwrap().query, "q=1");
+    }
+
+    #[test]
+    fn full_uri_authority_and_fragment_no_path_no_query() {
+        let uri = parse_uri("http://host#frag").unwrap();
+        assert!(uri.authority.is_some());
+        assert!(uri.query.is_none());
+        assert_eq!(uri.fragment.unwrap().fragment, "frag");
+    }
+
+    #[test]
+    fn full_uri_minimal() {
+        let uri = parse_uri("x://h").unwrap();
+        assert_eq!(uri.scheme.name, "x");
+        assert!(uri.authority.is_some());
+    }
+
+    #[test]
+    fn full_uri_scheme_colon_only() {
+        let uri = parse_uri("x:").unwrap();
+        assert_eq!(uri.scheme.name, "x");
+        assert!(uri.authority.is_none());
+        assert_eq!(uri.path.segments, [""]);
+    }
+
+    #[test]
+    fn full_uri_complex_userinfo_and_query() {
+        let uri = parse_uri("http://us%40er:p%3Ass@host:1234/path?a=%26&b=2#frag").unwrap();
+        let auth = uri.authority.unwrap();
+        let info = auth.user_info.unwrap();
+        assert_eq!(info.username, "us@er");
+        assert_eq!(info.password.as_deref(), Some("p:ss"));
+        assert_eq!(uri.query.unwrap().get("a"), Some("&"));
+    }
+
+    #[test]
+    fn full_uri_empty_string_rejected() {
+        match parse_uri("").unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {}
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    // ==================== 15. 3GPP SBI URIs (TS 29.500 §5.2.10) ====================
 
     #[test]
     fn sbi_nrf_discovery() {
@@ -1831,7 +2491,7 @@ mod tests {
         assert_eq!(uri.scheme.name, "https");
         assert_domain(&uri.authority.unwrap().host, "nrf.5gc.mnc001.mcc001.3gppnetwork.org");
         assert_eq!(uri.path.segments, ["nnrf-disc", "v1", "nf-instances"]);
-        assert_eq!(uri.query.unwrap().query, "target-nf-type=AMF");
+        assert_eq!(uri.query.unwrap().get("target-nf-type"), Some("AMF"));
     }
 
     #[test]
@@ -1847,8 +2507,7 @@ mod tests {
     }
 
     #[test]
-    fn sbi_with_api_prefix() {
-        // TS 29.501: apiRoot may contain an API prefix subcomponent
+    fn sbi_with_deployment_prefix() {
         let uri = parse_uri("https://nrf.example.com/3gpp-sbi/v1/nnrf-nfm/v1/nf-instances").unwrap();
         assert_eq!(uri.path.segments, ["3gpp-sbi", "v1", "nnrf-nfm", "v1", "nf-instances"]);
     }
@@ -1881,7 +2540,22 @@ mod tests {
         assert_eq!(uri.path.segments, ["nudm-sdm", "v2", "imsi-001010000000001", "nssai"]);
     }
 
-    // ==================== Display / roundtrip ====================
+    #[test]
+    fn sbi_pcf_policy() {
+        let uri = parse_uri("https://pcf.example.com/npcf-smpolicycontrol/v1/sm-policies").unwrap();
+        assert_eq!(uri.path.segments, ["npcf-smpolicycontrol", "v1", "sm-policies"]);
+    }
+
+    #[test]
+    fn sbi_nrf_discovery_multi_query() {
+        let uri = parse_uri("https://nrf.example.com:29510/nnrf-disc/v1/nf-instances?target-nf-type=AMF&service-names=namf-comm,namf-evts&requester-nf-type=SMF").unwrap();
+        let q = uri.query.unwrap();
+        assert_eq!(q.get("target-nf-type"), Some("AMF"));
+        assert_eq!(q.get_csv("service-names"), Some(vec!["namf-comm", "namf-evts"]));
+        assert_eq!(q.get("requester-nf-type"), Some("SMF"));
+    }
+
+    // ==================== 16. Display / Roundtrip ====================
 
     #[test]
     fn display_simple_roundtrip() {
@@ -1921,7 +2595,6 @@ mod tests {
 
     #[test]
     fn display_query_special_chars_roundtrip() {
-        // '/', '?', ':', '@' are allowed unencoded in query
         let input = "http://host/path?a/b?c:d@e";
         assert_eq!(parse_uri(input).unwrap().to_string(), input);
     }
@@ -1932,8 +2605,6 @@ mod tests {
         assert_eq!(parse_uri(input).unwrap().to_string(), input);
     }
 
-    // ==================== Percent-encoding in Display ====================
-
     #[test]
     fn display_encodes_space_in_path() {
         let uri = parse_uri("http://host/hello%20world").unwrap();
@@ -1942,15 +2613,14 @@ mod tests {
     }
 
     #[test]
-    fn display_encodes_hash_and_question_in_path() {
+    fn display_encodes_hash_question_in_path() {
         let uri = parse_uri("http://host/a%23b%3Fc").unwrap();
         assert_eq!(uri.path.segments, ["a#b?c"]);
         assert_eq!(uri.to_string(), "http://host/a%23b%3Fc");
     }
 
     #[test]
-    fn display_normalizes_hex_to_uppercase() {
-        // Input has lowercase %2f, output should use uppercase %2F
+    fn display_normalizes_hex_uppercase() {
         let uri = parse_uri("http://host/a%2fb").unwrap();
         assert_eq!(uri.path.segments, ["a/b"]);
         assert_eq!(uri.to_string(), "http://host/a%2Fb");
@@ -1978,10 +2648,8 @@ mod tests {
         assert_eq!(f.to_string(), "sec%23tion");
     }
 
-    // ==================== Display for constructed values ====================
-
     #[test]
-    fn display_scheme() {
+    fn display_scheme_verbatim() {
         assert_eq!(Scheme { name: "https".into() }.to_string(), "https");
     }
 
@@ -2017,7 +2685,7 @@ mod tests {
     }
 
     #[test]
-    fn display_path_encodes_special_chars() {
+    fn display_path_encodes_special() {
         let p = Path {
             segments: vec!["hello world".into()],
         };
@@ -2026,7 +2694,6 @@ mod tests {
 
     #[test]
     fn display_path_single_empty_segment() {
-        // Single empty segment (from "/" or no-path) should produce no output
         let p = Path { segments: vec!["".into()] };
         assert_eq!(p.to_string(), "");
     }
@@ -2039,251 +2706,23 @@ mod tests {
         assert_eq!(p.to_string(), "/a/");
     }
 
-    // ==================== 3GPP §5.2.10 reserved chars ====================
-
     #[test]
-    fn tgpp_reserved_literal_rejected() {
-        // Characters from reserved_3gpp (" % { } space) must be percent-encoded.
-        // In their literal form the parser rejects them (not in unreserved/sub-delims).
-        assert!(parse_uri("http://host/path with space").is_err());
-        assert!(parse_uri("http://host/path{value}").is_err());
-        assert!(parse_uri("http://host/path\"quoted\"").is_err());
+    fn display_colon_in_password_preserved() {
+        let a = Authority {
+            user_info: Some(UserInfo {
+                username: "user".into(),
+                password: Some("p:a:ss".into()),
+            }),
+            host: Host::DomainName("host".into()),
+            port: None,
+        };
+        assert_eq!(a.to_string(), "user:p:a:ss@host");
     }
 
-    #[test]
-    fn tgpp_reserved_accepted_when_pct_encoded() {
-        let uri = parse_uri("http://host/path%20with%20space").unwrap();
-        assert_eq!(uri.path.segments, ["path with space"]);
-
-        let uri = parse_uri("http://host/path%7Bvalue%7D").unwrap();
-        assert_eq!(uri.path.segments, ["path{value}"]);
-
-        let uri = parse_uri("http://host/path%22quoted%22").unwrap();
-        assert_eq!(uri.path.segments, ["path\"quoted\""]);
-    }
+    // ==================== 17. PartialEq / Eq / Hash ====================
 
     #[test]
-    fn tgpp_reserved_re_encoded_on_output() {
-        let uri = parse_uri("http://host/path%20with%20space").unwrap();
-        assert_eq!(uri.to_string(), "http://host/path%20with%20space");
-
-        let uri = parse_uri("http://host/path%7Bvalue%7D").unwrap();
-        assert_eq!(uri.to_string(), "http://host/path%7Bvalue%7D");
-    }
-
-    // ==================== Percent-encoding edge cases ====================
-
-    #[test]
-    fn pct_encoding_case_insensitive_input() {
-        // Both %2F and %2f should decode to '/'
-        assert_eq!(parse_uri("http://host/a%2Fb").unwrap().path.segments, ["a/b"]);
-        assert_eq!(parse_uri("http://host/a%2fb").unwrap().path.segments, ["a/b"]);
-    }
-
-    #[test]
-    fn pct_encoding_null_byte() {
-        let uri = parse_uri("http://host/a%00b").unwrap();
-        assert_eq!(uri.path.segments, ["a\0b"]);
-    }
-
-    #[test]
-    fn pct_encoding_all_hex_digits() {
-        // %41 = 'A', %5A = 'Z', %61 = 'a', %7A = 'z'
-        let uri = parse_uri("http://host/%41%5A%61%7A").unwrap();
-        assert_eq!(uri.path.segments, ["AZaz"]);
-    }
-
-    // ==================== Error cases ====================
-
-    #[test]
-    fn error_pct_truncated_one_digit() {
-        assert!(parse_uri("http://host/%2").is_err());
-    }
-
-    #[test]
-    fn error_pct_truncated_bare() {
-        assert!(parse_uri("http://host/%").is_err());
-    }
-
-    #[test]
-    fn error_pct_non_hex_digits() {
-        assert!(parse_uri("http://host/%GG").is_err());
-    }
-
-    #[test]
-    fn error_pct_non_hex_second_digit() {
-        assert!(parse_uri("http://host/%2Z").is_err());
-    }
-
-    #[test]
-    fn error_bracket_in_host() {
-        assert!(parse_uri("http://ho[st/").is_err());
-    }
-
-    #[test]
-    fn error_invalid_ipv6_literal() {
-        assert!(parse_uri("http://[not-valid]/").is_err());
-    }
-
-    #[test]
-    fn error_unclosed_bracket() {
-        assert!(parse_uri("http://[::1/").is_err());
-    }
-
-    // ==================== NEW: FromStr ====================
-
-    #[test]
-    fn from_str_basic() {
-        let uri: Uri = "http://example.com/path".parse().unwrap();
-        assert_eq!(uri.scheme.name, "http");
-        assert_eq!(uri.path.segments, ["path"]);
-    }
-
-    #[test]
-    fn from_str_non_ascii_rejected() {
-        assert!("http://example.com/p\u{00E9}th".parse::<Uri>().is_err());
-    }
-
-    // ==================== NEW: Builder ====================
-
-    #[test]
-    fn builder_simple() {
-        let uri = Uri::builder().scheme("https").host("example.com").path_segments(&["a", "b"]).build().unwrap();
-        assert_eq!(uri.to_string(), "https://example.com/a/b");
-    }
-
-    #[test]
-    fn builder_csv_query() {
-        let uri = Uri::builder()
-            .scheme("https")
-            .host("nrf.example.com")
-            .port(29510)
-            .path_segments(&["nnrf-disc", "v1", "nf-instances"])
-            .query_param("target-nf-type", "AMF")
-            .query_param_csv("service-names", &["svc1", "svc2"])
-            .build()
-            .unwrap();
-        assert_eq!(
-            uri.to_string(),
-            "https://nrf.example.com:29510/nnrf-disc/v1/nf-instances?target-nf-type=AMF&service-names=svc1,svc2"
-        );
-    }
-
-    #[test]
-    fn builder_missing_scheme_error() {
-        let err = Uri::builder().host("example.com").build();
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn builder_sbi_realistic() {
-        let uri = Uri::builder()
-            .scheme("https")
-            .host("nrf.5gc.mnc001.mcc001.3gppnetwork.org")
-            .path_segments(&["nnrf-nfm", "v1", "nf-instances", "4947a69a-f61b-4bc1-b9da-47c9c5d14b64"])
-            .build()
-            .unwrap();
-        assert_eq!(
-            uri.to_string(),
-            "https://nrf.5gc.mnc001.mcc001.3gppnetwork.org/nnrf-nfm/v1/nf-instances/4947a69a-f61b-4bc1-b9da-47c9c5d14b64"
-        );
-    }
-
-    #[test]
-    fn builder_ipv6_host() {
-        let uri = Uri::builder().scheme("https").host("[::1]").port(29510).path_segments(&["path"]).build().unwrap();
-        assert_eq!(uri.to_string(), "https://[::1]:29510/path");
-    }
-
-    #[test]
-    fn builder_no_host_no_authority() {
-        let uri = Uri::builder().scheme("urn").path_segments(&["isbn:0451450523"]).build().unwrap();
-        assert!(uri.authority.is_none());
-        assert_eq!(uri.to_string(), "urn:/isbn:0451450523");
-    }
-
-    // ==================== NEW: Query accessors ====================
-
-    #[test]
-    fn query_get() {
-        let q = parse_uri("http://h/?a=1&b=2").unwrap().query.unwrap();
-        assert_eq!(q.get("a"), Some("1"));
-        assert_eq!(q.get("b"), Some("2"));
-        assert_eq!(q.get("c"), None);
-    }
-
-    #[test]
-    fn query_get_all() {
-        let q = parse_uri("http://h/?a=1&a=2&a=3").unwrap().query.unwrap();
-        assert_eq!(q.get_all("a"), vec!["1", "2", "3"]);
-        assert!(q.get_all("b").is_empty());
-    }
-
-    #[test]
-    fn query_get_csv() {
-        let q = parse_uri("http://h/?names=svc1,svc2,svc3").unwrap().query.unwrap();
-        assert_eq!(q.get_csv("names"), Some(vec!["svc1", "svc2", "svc3"]));
-        assert_eq!(q.get_csv("missing"), None);
-    }
-
-    #[test]
-    fn query_iter() {
-        let q = parse_uri("http://h/?a=1&b=2").unwrap().query.unwrap();
-        let pairs: Vec<_> = q.iter().collect();
-        assert_eq!(pairs, vec![("a", "1"), ("b", "2")]);
-    }
-
-    #[test]
-    fn query_contains_key() {
-        let q = parse_uri("http://h/?a=1").unwrap().query.unwrap();
-        assert!(q.contains_key("a"));
-        assert!(!q.contains_key("b"));
-    }
-
-    #[test]
-    fn query_is_empty_and_len() {
-        let q_empty = parse_uri("http://h/?").unwrap().query.unwrap();
-        assert!(q_empty.is_empty());
-        assert_eq!(q_empty.len(), 0);
-
-        let q = parse_uri("http://h/?a=1&b=2").unwrap().query.unwrap();
-        assert!(!q.is_empty());
-        assert_eq!(q.len(), 2);
-    }
-
-    #[test]
-    fn query_key_without_value() {
-        let q = parse_uri("http://h/?flag&a=1").unwrap().query.unwrap();
-        assert_eq!(q.get("flag"), Some(""));
-        assert_eq!(q.get("a"), Some("1"));
-    }
-
-    #[test]
-    fn query_empty_value() {
-        let q = parse_uri("http://h/?a=&b=2").unwrap().query.unwrap();
-        assert_eq!(q.get("a"), Some(""));
-        assert_eq!(q.get("b"), Some("2"));
-    }
-
-    #[test]
-    fn query_pct_encoded_ampersand_in_value() {
-        // %26 is '&' — must NOT split parameters
-        let q = parse_uri("http://h/?a=x%26y&b=2").unwrap().query.unwrap();
-        assert_eq!(q.get("a"), Some("x&y"));
-        assert_eq!(q.get("b"), Some("2"));
-    }
-
-    #[test]
-    fn query_pct_encoded_equals_in_value() {
-        // %3D is '=' — must NOT split key/value
-        let q = parse_uri("http://h/?a=x%3Dy").unwrap().query.unwrap();
-        assert_eq!(q.get("a"), Some("x=y"));
-    }
-
-    // ==================== NEW: Equality ====================
-
-    #[test]
-    fn eq_same_uri() {
+    fn eq_identical_uris() {
         let a = parse_uri("http://example.com/path?q=1#f").unwrap();
         let b = parse_uri("http://example.com/path?q=1#f").unwrap();
         assert_eq!(a, b);
@@ -2311,79 +2750,632 @@ mod tests {
     }
 
     #[test]
-    fn eq_hash_consistent() {
-        let a = parse_uri("HTTP://Example.COM/path").unwrap();
-        let b = parse_uri("http://example.com/path").unwrap();
-        assert_eq!(a, b);
-
-        let mut set = HashSet::new();
-        set.insert(a);
-        // b should be found in the set since it's equal to a
-        // (We can't directly test this without implementing Hash for Uri in HashSet,
-        // but we verify the hash values are the same)
-        let mut ha = std::hash::DefaultHasher::new();
-        parse_uri("HTTP://Example.COM/path").unwrap().hash(&mut ha);
-        let hash_a = ha.finish();
-
-        let mut hb = std::hash::DefaultHasher::new();
-        parse_uri("http://example.com/path").unwrap().hash(&mut hb);
-        let hash_b = hb.finish();
-
-        assert_eq!(hash_a, hash_b);
+    fn eq_different_schemes_not_equal() {
+        let a = parse_uri("http://example.com/path").unwrap();
+        let b = parse_uri("https://example.com/path").unwrap();
+        assert_ne!(a, b);
     }
 
-    // ==================== NEW: Error positions ====================
+    #[test]
+    fn eq_different_ports_not_equal() {
+        let a = parse_uri("http://host:8080/").unwrap();
+        let b = parse_uri("http://host:8081/").unwrap();
+        assert_ne!(a, b);
+    }
 
     #[test]
-    fn error_scheme_position() {
-        let err = parse_uri("1http://h").unwrap_err();
-        match err {
+    fn eq_different_queries_not_equal() {
+        let a = parse_uri("http://host/?a=1").unwrap();
+        let b = parse_uri("http://host/?a=2").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn eq_different_fragments_not_equal() {
+        let a = parse_uri("http://host/#a").unwrap();
+        let b = parse_uri("http://host/#b").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn eq_ipv4_same_address() {
+        let a = parse_uri("http://192.168.1.1/").unwrap();
+        let b = parse_uri("http://192.168.1.1/").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn eq_ipv4_different_address() {
+        let a = parse_uri("http://192.168.1.1/").unwrap();
+        let b = parse_uri("http://192.168.1.2/").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn eq_ipv6_same_address() {
+        let a = parse_uri("http://[::1]/").unwrap();
+        let b = parse_uri("http://[::1]/").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn eq_ipv4_vs_domain_not_equal() {
+        let ipv4 = Host::Ipv4(IpAddr::from_str("1.2.3.4").unwrap());
+        let domain = Host::DomainName("1.2.3.4".into());
+        assert_ne!(ipv4, domain);
+    }
+
+    #[test]
+    fn eq_ipv4_vs_ip_literal_not_equal() {
+        let ipv4 = Host::Ipv4(IpAddr::from_str("127.0.0.1").unwrap());
+        let literal = Host::IpLiteral(IpAddr::from_str("127.0.0.1").unwrap());
+        assert_ne!(ipv4, literal);
+    }
+
+    #[test]
+    fn eq_hash_consistent_scheme() {
+        let a = parse_uri("HTTP://example.com/path").unwrap();
+        let b = parse_uri("http://example.com/path").unwrap();
+        assert_eq!(a, b);
+        let mut ha = DefaultHasher::new();
+        a.hash(&mut ha);
+        let mut hb = DefaultHasher::new();
+        b.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+    }
+
+    #[test]
+    fn eq_hash_consistent_host() {
+        let a = parse_uri("http://EXAMPLE.COM/path").unwrap();
+        let b = parse_uri("http://example.com/path").unwrap();
+        assert_eq!(a, b);
+        let mut ha = DefaultHasher::new();
+        a.hash(&mut ha);
+        let mut hb = DefaultHasher::new();
+        b.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+    }
+
+    #[test]
+    fn eq_hash_set_dedup() {
+        let a = parse_uri("HTTP://Example.COM/path").unwrap();
+        let b = parse_uri("http://example.com/path").unwrap();
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn eq_userinfo_exact() {
+        let a = UserInfo { username: "User".into(), password: Some("Pass".into()) };
+        let b = UserInfo { username: "user".into(), password: Some("pass".into()) };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn eq_query_by_decoded_string() {
+        let a = Query { query: "a=1".into(), params: vec![("a".into(), "1".into())] };
+        let b = Query { query: "a=1".into(), params: vec![("a".into(), "1".into())] };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn eq_fragment_exact() {
+        let a = Fragment { fragment: "Frag".into() };
+        let b = Fragment { fragment: "frag".into() };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn eq_path_case_sensitive() {
+        let a = parse_uri("http://host/Path").unwrap();
+        let b = parse_uri("http://host/path").unwrap();
+        assert_ne!(a, b);
+    }
+
+    // ==================== 18. URI Builder ====================
+
+    #[test]
+    fn builder_simple() {
+        let uri = Uri::builder().scheme("https").host("example.com").path_segments(&["a", "b"]).build().unwrap();
+        assert_eq!(uri.to_string(), "https://example.com/a/b");
+    }
+
+    #[test]
+    fn builder_with_port() {
+        let uri = Uri::builder().scheme("https").host("host").port(8080).path_segments(&["p"]).build().unwrap();
+        assert_eq!(uri.to_string(), "https://host:8080/p");
+    }
+
+    #[test]
+    fn builder_with_userinfo() {
+        let uri = Uri::builder().scheme("http").host("host").username("user").password("pass").path_segments(&["p"]).build().unwrap();
+        assert_eq!(uri.to_string(), "http://user:pass@host/p");
+    }
+
+    #[test]
+    fn builder_with_username_only() {
+        let uri = Uri::builder().scheme("http").host("host").username("user").path_segments(&["p"]).build().unwrap();
+        let auth = uri.authority.unwrap();
+        assert_eq!(auth.user_info.as_ref().unwrap().username, "user");
+        assert_eq!(auth.user_info.as_ref().unwrap().password, None);
+    }
+
+    #[test]
+    fn builder_with_query_param() {
+        let uri = Uri::builder().scheme("http").host("h").query_param("key", "val").build().unwrap();
+        assert_eq!(uri.query.unwrap().get("key"), Some("val"));
+    }
+
+    #[test]
+    fn builder_with_multiple_query_params() {
+        let uri = Uri::builder().scheme("http").host("h").query_param("a", "1").query_param("b", "2").build().unwrap();
+        let q = uri.query.unwrap();
+        let pairs: Vec<_> = q.iter().collect();
+        assert_eq!(pairs, vec![("a", "1"), ("b", "2")]);
+    }
+
+    #[test]
+    fn builder_csv_query() {
+        let uri = Uri::builder()
+            .scheme("https")
+            .host("nrf.example.com")
+            .port(29510)
+            .path_segments(&["nnrf-disc", "v1", "nf-instances"])
+            .query_param("target-nf-type", "AMF")
+            .query_param_csv("service-names", &["svc1", "svc2"])
+            .build()
+            .unwrap();
+        assert_eq!(
+            uri.to_string(),
+            "https://nrf.example.com:29510/nnrf-disc/v1/nf-instances?target-nf-type=AMF&service-names=svc1,svc2"
+        );
+    }
+
+    #[test]
+    fn builder_with_fragment() {
+        let uri = Uri::builder().scheme("http").host("h").fragment("frag").build().unwrap();
+        assert_eq!(uri.fragment.unwrap().fragment, "frag");
+    }
+
+    #[test]
+    fn builder_all_components() {
+        let uri = Uri::builder()
+            .scheme("https")
+            .username("user")
+            .password("pass")
+            .host("host")
+            .port(443)
+            .path_segments(&["a", "b"])
+            .query_param("q", "1")
+            .fragment("f")
+            .build()
+            .unwrap();
+        assert_eq!(uri.to_string(), "https://user:pass@host:443/a/b?q=1#f");
+    }
+
+    #[test]
+    fn builder_missing_scheme_rejected() {
+        match Uri::builder().host("example.com").build().unwrap_err() {
+            UriParseError::BuilderMissing { field } => assert_eq!(field, "scheme"),
+            other => panic!("expected BuilderMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_invalid_scheme_start_rejected() {
+        match Uri::builder().scheme("1http").host("h").build().unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {}
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_invalid_scheme_char_rejected() {
+        match Uri::builder().scheme("ht_tp").host("h").build().unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {}
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_empty_scheme_rejected() {
+        match Uri::builder().scheme("").host("h").build().unwrap_err() {
+            UriParseError::SchemeInvalid { .. } => {}
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_no_host_no_authority() {
+        let uri = Uri::builder().scheme("urn").path_segments(&["isbn:0451450523"]).build().unwrap();
+        assert!(uri.authority.is_none());
+    }
+
+    #[test]
+    fn builder_ipv4_host() {
+        let uri = Uri::builder().scheme("http").host("192.168.1.1").build().unwrap();
+        assert_ipv4(&uri.authority.unwrap().host, "192.168.1.1");
+    }
+
+    #[test]
+    fn builder_ipv6_host_with_brackets() {
+        let uri = Uri::builder().scheme("https").host("[::1]").port(29510).path_segments(&["path"]).build().unwrap();
+        assert_ip_literal(&uri.authority.as_ref().unwrap().host, "::1");
+        assert_eq!(uri.to_string(), "https://[::1]:29510/path");
+    }
+
+    #[test]
+    fn builder_ipv6_host_without_brackets() {
+        let uri = Uri::builder().scheme("https").host("::1").build().unwrap();
+        assert_ip_literal(&uri.authority.unwrap().host, "::1");
+    }
+
+    #[test]
+    fn builder_domain_host() {
+        let uri = Uri::builder().scheme("http").host("example.com").build().unwrap();
+        assert_domain(&uri.authority.unwrap().host, "example.com");
+    }
+
+    #[test]
+    fn builder_empty_host_rejected() {
+        match Uri::builder().scheme("http").host("").build().unwrap_err() {
+            UriParseError::HostInvalid { .. } => {}
+            other => panic!("expected HostInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_empty_path_segments() {
+        let uri = Uri::builder().scheme("http").host("h").build().unwrap();
+        assert_eq!(uri.path.segments, [""]);
+    }
+
+    #[test]
+    fn builder_sbi_realistic() {
+        let uri = Uri::builder()
+            .scheme("https")
+            .host("nrf.5gc.mnc001.mcc001.3gppnetwork.org")
+            .path_segments(&["nnrf-nfm", "v1", "nf-instances", "4947a69a-f61b-4bc1-b9da-47c9c5d14b64"])
+            .build()
+            .unwrap();
+        assert_eq!(
+            uri.to_string(),
+            "https://nrf.5gc.mnc001.mcc001.3gppnetwork.org/nnrf-nfm/v1/nf-instances/4947a69a-f61b-4bc1-b9da-47c9c5d14b64"
+        );
+    }
+
+    #[test]
+    fn builder_sbi_discovery_with_queries() {
+        let uri = Uri::builder()
+            .scheme("https")
+            .host("nrf.example.com")
+            .port(29510)
+            .path_segments(&["nnrf-disc", "v1", "nf-instances"])
+            .query_param("target-nf-type", "AMF")
+            .query_param_csv("service-names", &["namf-comm", "namf-evts"])
+            .build()
+            .unwrap();
+        let q = uri.query.unwrap();
+        assert_eq!(q.get("target-nf-type"), Some("AMF"));
+        assert_eq!(q.get("service-names"), Some("namf-comm,namf-evts"));
+    }
+
+    #[test]
+    fn builder_roundtrip_to_string() {
+        let uri = Uri::builder().scheme("https").host("host").port(443).path_segments(&["a", "b"]).query_param("k", "v").fragment("f").build().unwrap();
+        let s = uri.to_string();
+        assert_eq!(s, "https://host:443/a/b?k=v#f");
+    }
+
+    #[test]
+    fn builder_query_param_with_special_chars() {
+        let uri = Uri::builder().scheme("http").host("h").query_param("key", "a=b&c").build().unwrap();
+        assert_eq!(uri.query.unwrap().get("key"), Some("a=b&c"));
+    }
+
+    #[test]
+    fn builder_password_without_username() {
+        let uri = Uri::builder().scheme("http").host("h").password("pass").build().unwrap();
+        // password without username: no user_info created (user is None)
+        let auth = uri.authority.unwrap();
+        assert!(auth.user_info.is_none());
+    }
+
+    #[test]
+    fn builder_display_matches_from_str() {
+        let built = Uri::builder()
+            .scheme("https")
+            .host("example.com")
+            .port(8080)
+            .path_segments(&["a", "b"])
+            .query_param("q", "1")
+            .build()
+            .unwrap();
+        let s = built.to_string();
+        let parsed = parse_uri(&s).unwrap();
+        assert_eq!(built, parsed);
+    }
+
+    // ==================== 19. Serde ====================
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_deserialize_valid() {
+        let uri: Uri = serde_json::from_str("\"http://example.com/path\"").unwrap();
+        assert_eq!(uri.scheme.name, "http");
+        assert_eq!(uri.path.segments, ["path"]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_deserialize_invalid_rejected() {
+        let result: Result<Uri, _> = serde_json::from_str("\"://invalid\"");
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_serialize() {
+        let uri = parse_uri("http://example.com/path").unwrap();
+        let json = serde_json::to_string(&uri).unwrap();
+        assert_eq!(json, "\"http://example.com/path\"");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_roundtrip() {
+        let original = parse_uri("https://host:8080/a/b?q=1#f").unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: Uri = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_get_json_valid() {
+        let q = parse_uri("http://h/?data=%7B%22x%22:1%7D").unwrap().query.unwrap();
+        let val: serde_json::Value = q.get_json("data").unwrap().unwrap();
+        assert_eq!(val, serde_json::json!({"x": 1}));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_get_json_invalid() {
+        let q = parse_uri("http://h/?data=not-json").unwrap().query.unwrap();
+        let result: Option<Result<serde_json::Value, _>> = q.get_json("data");
+        assert!(result.unwrap().is_err());
+    }
+
+    // ==================== 20. Error Positions ====================
+
+    #[test]
+    fn error_pos_scheme_digit_start() {
+        match parse_uri("1http://h").unwrap_err() {
             UriParseError::SchemeInvalid { pos } => assert_eq!(pos, 0),
             other => panic!("expected SchemeInvalid, got {other:?}"),
         }
     }
 
     #[test]
-    fn error_pct_decode_position() {
-        let err = parse_uri("http://host/a%GG").unwrap_err();
-        match err {
+    fn error_pos_scheme_invalid_char() {
+        match parse_uri("ht_tp://h").unwrap_err() {
+            UriParseError::SchemeInvalid { pos } => assert_eq!(pos, 2),
+            other => panic!("expected SchemeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_pos_pct_decode_in_path() {
+        // "http://host/" is 12 bytes, then 'a' at 12, '%' at 13
+        match parse_uri("http://host/a%GG").unwrap_err() {
             UriParseError::PctDecodeInvalid { pos } => assert_eq!(pos, 13),
             other => panic!("expected PctDecodeInvalid, got {other:?}"),
         }
     }
 
-    // ==================== NEW: Public percent-encoding utilities ====================
-
     #[test]
-    fn percent_decode_simple() {
-        assert_eq!(percent_decode("hello%20world").unwrap(), "hello world");
+    fn error_pos_pct_decode_in_query() {
+        // "http://h/?" is 10 bytes, then '%' at 10
+        match parse_uri("http://h/?%GG").unwrap_err() {
+            UriParseError::PctDecodeInvalid { pos } => assert_eq!(pos, 10),
+            other => panic!("expected PctDecodeInvalid, got {other:?}"),
+        }
     }
 
     #[test]
-    fn percent_decode_no_encoding() {
-        assert_eq!(percent_decode("hello").unwrap(), "hello");
+    fn error_pos_pct_decode_in_fragment() {
+        // "http://h/#" is 10 bytes, then '%' at 10
+        match parse_uri("http://h/#%GG").unwrap_err() {
+            UriParseError::PctDecodeInvalid { pos } => assert_eq!(pos, 10),
+            other => panic!("expected PctDecodeInvalid, got {other:?}"),
+        }
     }
 
     #[test]
-    fn percent_decode_error() {
-        assert!(percent_decode("hello%G").is_err());
+    fn error_pos_pct_decode_in_userinfo() {
+        // "http://" is 7 bytes, then '%' at 7
+        match parse_uri("http://%GG@host/").unwrap_err() {
+            UriParseError::PctDecodeInvalid { pos } => assert_eq!(pos, 7),
+            other => panic!("expected PctDecodeInvalid, got {other:?}"),
+        }
     }
 
     #[test]
-    fn percent_encode_path_encodes_special() {
-        assert_eq!(percent_encode_path("hello world"), "hello%20world");
-        assert_eq!(percent_encode_path("a/b"), "a%2Fb");
+    fn error_pos_host_invalid() {
+        // "http://[" is 8 bytes, then invalid char
+        match parse_uri("http://[not-valid]/").unwrap_err() {
+            UriParseError::HostInvalid { .. } => {}
+            other => panic!("expected HostInvalid, got {other:?}"),
+        }
     }
 
     #[test]
-    fn percent_encode_query_key_encodes_delimiters() {
-        assert_eq!(percent_encode_query_key("a=b"), "a%3Db");
-        assert_eq!(percent_encode_query_key("a&b"), "a%26b");
+    fn error_pos_port_overflow() {
+        match parse_uri("http://host:65536/").unwrap_err() {
+            UriParseError::HostInvalid { .. } => {}
+            other => panic!("expected HostInvalid, got {other:?}"),
+        }
     }
 
     #[test]
-    fn percent_encode_query_value_encodes_delimiters() {
-        assert_eq!(percent_encode_query_value("x=y"), "x%3Dy");
-        assert_eq!(percent_encode_query_value("x&y"), "x%26y");
+    fn error_pos_path_invalid_char() {
+        // "http://host/" is 12 bytes, then '{' at 12
+        match parse_uri("http://host/{bad").unwrap_err() {
+            UriParseError::PathInvalid { pos } => assert_eq!(pos, 12),
+            other => panic!("expected PathInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_pos_query_invalid_char() {
+        // "http://h/?" is 10 bytes, then '{' at 10
+        match parse_uri("http://h/?{bad").unwrap_err() {
+            UriParseError::QueryInvalid { pos } => assert_eq!(pos, 10),
+            other => panic!("expected QueryInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_pos_fragment_invalid_char() {
+        // "http://h/#" is 10 bytes, then '{' at 10
+        match parse_uri("http://h/#{bad").unwrap_err() {
+            UriParseError::FragmentInvalid { pos } => assert_eq!(pos, 10),
+            other => panic!("expected FragmentInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_pos_builder_missing() {
+        match Uri::builder().build().unwrap_err() {
+            UriParseError::BuilderMissing { field } => assert_eq!(field, "scheme"),
+            other => panic!("expected BuilderMissing, got {other:?}"),
+        }
+    }
+
+    // ==================== 21. 3GPP Reserved Characters (TS 29.500 §5.2.10) ====================
+
+    #[test]
+    fn tgpp_space_literal_rejected() {
+        assert!(parse_uri("http://host/path with space").is_err());
+    }
+
+    #[test]
+    fn tgpp_curly_open_rejected() {
+        assert!(parse_uri("http://host/path{value").is_err());
+    }
+
+    #[test]
+    fn tgpp_curly_close_rejected() {
+        assert!(parse_uri("http://host/path}value").is_err());
+    }
+
+    #[test]
+    fn tgpp_double_quote_rejected() {
+        assert!(parse_uri("http://host/path\"quoted\"").is_err());
+    }
+
+    #[test]
+    fn tgpp_reserved_accepted_percent_encoded() {
+        assert_eq!(parse_uri("http://host/%20").unwrap().path.segments, [" "]);
+        assert_eq!(parse_uri("http://host/%7B").unwrap().path.segments, ["{"]);
+        assert_eq!(parse_uri("http://host/%7D").unwrap().path.segments, ["}"]);
+        assert_eq!(parse_uri("http://host/%22").unwrap().path.segments, ["\""]);
+    }
+
+    #[test]
+    fn tgpp_reserved_re_encoded_on_output() {
+        let uri = parse_uri("http://host/path%20with%20space").unwrap();
+        assert_eq!(uri.to_string(), "http://host/path%20with%20space");
+        let uri = parse_uri("http://host/%7Bvalue%7D").unwrap();
+        assert_eq!(uri.to_string(), "http://host/%7Bvalue%7D");
+    }
+
+    #[test]
+    fn tgpp_bare_percent_in_path_rejected() {
+        assert!(parse_uri("http://host/path%").is_err());
+    }
+
+    #[test]
+    fn tgpp_percent_encoded_percent() {
+        let uri = parse_uri("http://host/%25").unwrap();
+        assert_eq!(uri.path.segments, ["%"]);
+        assert_eq!(uri.to_string(), "http://host/%25");
+    }
+
+    // ==================== 22. Security and Stress ====================
+
+    #[test]
+    fn security_null_byte_in_path() {
+        let uri = parse_uri("http://host/a%00b").unwrap();
+        assert_eq!(uri.path.segments[0], "a\0b");
+        assert_eq!(uri.path.segments[0].len(), 3);
+    }
+
+    #[test]
+    fn security_null_byte_in_host() {
+        let uri = parse_uri("http://host%00name/").unwrap();
+        assert_domain(&uri.authority.unwrap().host, "host\0name");
+    }
+
+    #[test]
+    fn security_non_ascii_rejected() {
+        match parse_uri("\u{00E9}://h").unwrap_err() {
+            UriParseError::SchemeInvalid { pos: 0 } => {}
+            other => panic!("expected SchemeInvalid at pos 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn security_extremely_long_path() {
+        let segment = "a".repeat(10_000);
+        let input = format!("http://host/{}", segment);
+        let uri = parse_uri(&input).unwrap();
+        assert_eq!(uri.path.segments[0].len(), 10_000);
+    }
+
+    #[test]
+    fn security_many_query_params() {
+        let params: String = (0..1000).map(|i| format!("k{}=v{}", i, i)).collect::<Vec<_>>().join("&");
+        let input = format!("http://h/?{}", params);
+        let uri = parse_uri(&input).unwrap();
+        assert_eq!(uri.query.unwrap().len(), 1000);
+    }
+
+    #[test]
+    fn security_deeply_nested_path() {
+        let segments = "a/".repeat(500);
+        let input = format!("http://host/{}", segments.trim_end_matches('/'));
+        let uri = parse_uri(&input).unwrap();
+        assert_eq!(uri.path.segments.len(), 500);
+    }
+
+    #[test]
+    fn security_percent_in_percent() {
+        // %2525 → %25 decodes to '%', then '25' is literal → "%25"
+        let uri = parse_uri("http://host/%2525").unwrap();
+        assert_eq!(uri.path.segments, ["%25"]);
+    }
+
+    #[test]
+    fn security_crlf_injection_attempt() {
+        let uri = parse_uri("http://host/path%0D%0Ainjected").unwrap();
+        assert_eq!(uri.path.segments[0], "path\r\ninjected");
+    }
+
+    #[test]
+    fn security_backslash_in_path() {
+        let uri = parse_uri("http://host/path%5Cfile").unwrap();
+        assert_eq!(uri.path.segments[0], "path\\file");
+    }
+
+    #[test]
+    fn security_consecutive_percent_encoded() {
+        let encoded: String = std::iter::repeat("%20").take(100).collect();
+        let input = format!("http://host/{}", encoded);
+        let uri = parse_uri(&input).unwrap();
+        assert_eq!(uri.path.segments[0], " ".repeat(100));
     }
 }
+

@@ -1,5 +1,5 @@
 [package]
-name = "ngc-nf"
+name = "ngc-nrf-server"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -8,5 +8,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-axum = { workspace = true }
 tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+
+ngc-nrf = { workspace = true }
